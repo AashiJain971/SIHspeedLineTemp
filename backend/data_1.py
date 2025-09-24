@@ -677,6 +677,584 @@ async def get_train_summary():
         "system_uptime_minutes": (datetime.now() - train_state.start_time).total_seconds() / 60
     }
 
+# ===== SIMULATION ENDPOINTS =====
+
+import httpx
+
+class SimulationRequest(BaseModel):
+    scenario_type: str  # 'delay', 'disruption', 'maintenance', 'weather'
+    parameters: Dict[str, Any]
+    use_real_time_data: bool = True
+
+class SimulationResult(BaseModel):
+    simulation_id: str
+    timestamp: str
+    input_data: Dict[str, Any]
+    projected_impact: Dict[str, Any]
+    recommendations: List[Dict[str, Any]]
+
+async def fetch_real_time_data() -> Dict[str, Any]:
+    """Fetch real-time data from existing backend endpoints"""
+    base_url = "http://127.0.0.1:8000"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Fetch all required data concurrently
+            train_data_response = await client.get(f"{base_url}/api/train-data")
+            trains_response = await client.get(f"{base_url}/trains")
+            disruptions_response = await client.get(f"{base_url}/api/disruptions")
+            health_response = await client.get(f"{base_url}/health")
+            
+            # Parse responses
+            train_data = train_data_response.json() if train_data_response.status_code == 200 else {}
+            trains_data = trains_response.json() if trains_response.status_code == 200 else {}
+            disruptions_data = disruptions_response.json() if disruptions_response.status_code == 200 else {}
+            health_data = health_response.json() if health_response.status_code == 200 else {}
+            
+            # Try to fetch schedule and optimization results (may not always be available)
+            try:
+                schedule_response = await client.get(f"{base_url}/api/schedule")
+                schedule_data = schedule_response.json() if schedule_response.status_code == 200 else {}
+            except:
+                schedule_data = {}
+            
+            try:
+                optimization_response = await client.get(f"{base_url}/api/optimization/results")
+                optimization_data = optimization_response.json() if optimization_response.status_code == 200 else {}
+            except:
+                optimization_data = {}
+            
+            return {
+                "train_data": train_data,
+                "trains": trains_data,
+                "disruptions": disruptions_data,
+                "health": health_data,
+                "schedule": schedule_data,
+                "optimization": optimization_data
+            }
+    except Exception as e:
+        logger.error(f"Error fetching real-time data: {e}")
+        # Return current state as fallback
+        return {
+            "train_data": generate_train_snapshot(),
+            "trains": {
+                "trains": train_state.trains,
+                "section_occupancy": train_state.occupied_sections,
+                "disruptions": train_state.section_disruptions,
+                "initialized": train_state.initialized
+            },
+            "disruptions": {"active_disruptions": train_state.section_disruptions},
+            "health": {
+                "status": "healthy",
+                "total_trains": len(train_state.trains),
+                "active_trains": len([t for t in train_state.trains.values() if t["status"] not in ["Arrived", "Cancelled"]]),
+                "active_disruptions": len(train_state.section_disruptions)
+            },
+            "schedule": {},
+            "optimization": {}
+        }
+
+def extract_trains_from_real_data(real_data: Dict) -> List[Dict]:
+    """Extract train information from real-time data"""
+    trains = []
+    
+    # Try to get trains from train_data payload first
+    if "train_data" in real_data and "payload" in real_data["train_data"]:
+        for bundle in real_data["train_data"]["payload"]:
+            if "train" in bundle:
+                train = bundle["train"]
+                trains.append({
+                    "train_id": train.get("train_id"),
+                    "type": train.get("type"),
+                    "priority": train.get("priority", 3),
+                    "current_section_id": train.get("current_location", {}).get("section_id"),
+                    "status": train.get("status"),
+                    "destination_station": train.get("destination_station"),
+                    "max_speed_kmh": train.get("max_speed_kmh", 120),
+                    "direction": train.get("direction", "forward")
+                })
+    
+    # Fallback to trains endpoint data
+    elif "trains" in real_data and "trains" in real_data["trains"]:
+        for train_id, train in real_data["trains"]["trains"].items():
+            trains.append({
+                "train_id": train_id,
+                "type": train.get("type"),
+                "priority": train.get("priority", 3),
+                "current_section_id": train.get("current_location", {}).get("section_id"),
+                "status": train.get("status"),
+                "destination_station": train.get("destination_station"),
+                "max_speed_kmh": train.get("max_speed_kmh", 120),
+                "direction": train.get("direction", "forward")
+            })
+    
+    return trains
+
+def extract_sections_from_real_data(real_data: Dict) -> List[Dict]:
+    """Extract section information from real-time data"""
+    sections = []
+    
+    # Try to get sections from train_data payload
+    if "train_data" in real_data and "payload" in real_data["train_data"]:
+        seen_sections = set()
+        for bundle in real_data["train_data"]["payload"]:
+            if "section" in bundle:
+                section = bundle["section"]
+                section_id = section.get("section_id")
+                if section_id and section_id not in seen_sections:
+                    sections.append({
+                        "id": section_id,
+                        "start": section.get("start_station"),
+                        "end": section.get("end_station"),
+                        "length_km": section.get("length_km", 10),
+                        "capacity": section.get("capacity", 2),
+                        "max_speed_kmh": section.get("max_speed_kmh", 120),
+                        "track_type": section.get("track_type", "double"),
+                        "occupancy_count": section.get("occupancy_count", 0)
+                    })
+                    seen_sections.add(section_id)
+    
+    # Fallback to hardcoded sections if no real data available
+    if not sections:
+        sections = SECTIONS
+    
+    return sections
+
+def calculate_system_load_from_real_data(trains: List[Dict], sections: List[Dict]) -> float:
+    """Calculate current system utilization percentage from real data"""
+    if not sections:
+        return 0.0
+    
+    total_capacity = sum(section.get("capacity", 1) for section in sections)
+    active_trains = len([t for t in trains if t.get("status") not in ["Arrived", "Cancelled", "out_of_service"]])
+    
+    return min(100.0, (active_trains / max(total_capacity, 1)) * 100)
+
+def find_alternative_routes_from_real_data(train: Dict, sections: List[Dict]) -> List[str]:
+    """Find alternative routes for a train using real section data"""
+    alternatives = []
+    current_section = train.get("current_section_id")
+    destination = train.get("destination_station")
+    
+    if current_section and destination:
+        # Find alternative sections that connect to destination
+        for section in sections:
+            if (section.get("id") != current_section and 
+                (section.get("end") == destination or section.get("start") == destination)):
+                alternatives.append(f"Route via {section.get('id')}")
+    
+    return alternatives[:3]  # Return max 3 alternatives
+
+def estimate_passenger_count_from_real_data(train: Dict) -> int:
+    """Estimate passenger count based on real train data"""
+    train_type = train.get("type", "Local")
+    current_hour = datetime.now().hour
+    
+    # Base passenger counts by train type
+    base_passengers = {
+        "Express": 300,
+        "High-Speed": 400,
+        "Local": 150,
+        "Freight": 0
+    }.get(train_type, 150)
+    
+    # Time-based multipliers (peak hours)
+    time_multiplier = 1.2 if 7 <= current_hour <= 9 or 17 <= current_hour <= 19 else 0.8
+    
+    # Status-based adjustments
+    status_multiplier = 0.9 if train.get("status") == "Delayed" else 1.0
+    
+    return int(base_passengers * time_multiplier * status_multiplier * (0.8 + random.random() * 0.4))
+
+def calculate_projected_delay_from_real_data(train: Dict, parameters: Dict) -> float:
+    """Calculate projected delay for a train based on scenario and real data"""
+    base_delay = parameters.get("duration_minutes", 30)
+    severity_multiplier = {
+        "low": 0.3,
+        "medium": 0.6,
+        "high": 0.9,
+        "critical": 1.2
+    }.get(parameters.get("severity", "medium"), 0.6)
+    
+    train_priority = train.get("priority", 3)
+    priority_factor = max(0.2, 1.0 - (train_priority - 1) * 0.2)
+    
+    # Consider current status
+    status_factor = 1.5 if train.get("status") == "Delayed" else 1.0
+    
+    return base_delay * severity_multiplier * priority_factor * status_factor
+
+def should_train_be_affected_by_real_scenario(train: Dict, parameters: Dict) -> bool:
+    """Determine if a train should be affected by the scenario using real data"""
+    target_train_id = parameters.get("train_id")
+    target_section_id = parameters.get("section_id")
+    
+    # If specific train is targeted
+    if target_train_id and train.get("train_id") == target_train_id:
+        return True
+    
+    # If specific section is targeted
+    if target_section_id and train.get("current_section_id") == target_section_id:
+        return True
+    
+    # If train is already in problematic state, higher chance of being affected
+    if train.get("status") in ["Delayed", "Waiting - Traffic", "Waiting - Section Disrupted"]:
+        base_probability = 0.7
+    else:
+        base_probability = {
+            "low": 0.2,
+            "medium": 0.4,
+            "high": 0.6,
+            "critical": 0.8
+        }.get(parameters.get("severity", "medium"), 0.4)
+    
+    return random.random() < base_probability
+
+def calculate_system_metrics_from_real_data(affected_trains: List[Dict], parameters: Dict, all_trains: List[Dict], sections: List[Dict]) -> Dict:
+    """Calculate overall system impact metrics using real data"""
+    total_delay = sum(train.get("projected_delay", 0) for train in affected_trains)
+    total_passengers = sum(train.get("passenger_count", 0) for train in affected_trains)
+    
+    # Calculate capacity utilization from real data
+    total_capacity = sum(section.get("capacity", 1) for section in sections)
+    active_trains = len([t for t in all_trains if t.get("status") not in ["Arrived", "Cancelled", "out_of_service"]])
+    capacity_utilization = min(100.0, (active_trains / max(total_capacity, 1)) * 100)
+    
+    # Estimate revenue impact based on real passenger counts
+    avg_ticket_price = 25.0  # USD
+    refund_rate = 0.15 if parameters.get("severity") in ["high", "critical"] else 0.10
+    revenue_impact = total_passengers * avg_ticket_price * refund_rate
+    
+    return {
+        "total_delay_minutes": total_delay,
+        "affected_passengers": total_passengers,
+        "revenue_impact": revenue_impact,
+        "capacity_utilization": capacity_utilization,
+        "alternative_routes_needed": len([t for t in affected_trains if t.get("alternative_routes")])
+    }
+
+def generate_recommendations_from_real_data(scenario_type: str, current_state: Dict, affected_count: int) -> List[Dict]:
+    """Generate recommendations based on scenario type and real system state"""
+    recommendations = []
+    
+    if scenario_type == "delay":
+        recommendations = [
+            {
+                "action": f"Deploy {min(affected_count // 2 + 1, 3)} additional trains on affected routes",
+                "priority": "high" if affected_count > 5 else "medium",
+                "estimated_benefit": f"Reduce delays by {20 + min(affected_count * 2, 20)}%",
+                "implementation_time": 15
+            },
+            {
+                "action": "Activate real-time passenger notification system",
+                "priority": "medium",
+                "estimated_benefit": "Improve passenger satisfaction by 40%",
+                "implementation_time": 2
+            },
+            {
+                "action": "Enable dynamic route optimization",
+                "priority": "medium",
+                "estimated_benefit": "Distribute load more efficiently",
+                "implementation_time": 8
+            }
+        ]
+    elif scenario_type == "disruption":
+        recommendations = [
+            {
+                "action": "Activate emergency response protocols immediately",
+                "priority": "critical",
+                "estimated_benefit": "Minimize service interruption",
+                "implementation_time": 1
+            },
+            {
+                "action": f"Reroute {affected_count} affected trains via alternative tracks",
+                "priority": "high",
+                "estimated_benefit": "Maintain 65-75% service capacity",
+                "implementation_time": 12
+            },
+            {
+                "action": "Deploy emergency shuttle services at affected stations",
+                "priority": "high",
+                "estimated_benefit": "Cover service gaps for passengers",
+                "implementation_time": 25
+            }
+        ]
+    elif scenario_type == "maintenance":
+        recommendations = [
+            {
+                "action": "Optimize maintenance scheduling for off-peak hours",
+                "priority": "medium",
+                "estimated_benefit": "Reduce passenger impact by 50-70%",
+                "implementation_time": 0
+            },
+            {
+                "action": "Increase service frequency on parallel routes",
+                "priority": "medium",
+                "estimated_benefit": "Maintain overall service quality",
+                "implementation_time": 20
+            },
+            {
+                "action": "Implement temporary speed restrictions",
+                "priority": "low",
+                "estimated_benefit": "Ensure safety during maintenance",
+                "implementation_time": 5
+            }
+        ]
+    else:  # weather
+        recommendations = [
+            {
+                "action": "Apply system-wide speed restrictions for safety",
+                "priority": "high",
+                "estimated_benefit": "Prevent weather-related incidents",
+                "implementation_time": 3
+            },
+            {
+                "action": "Increase train separation intervals",
+                "priority": "medium",
+                "estimated_benefit": "Enhanced safety margins",
+                "implementation_time": 8
+            },
+            {
+                "action": "Deploy additional maintenance crews",
+                "priority": "medium",
+                "estimated_benefit": "Quick response to weather issues",
+                "implementation_time": 15
+            }
+        ]
+    
+    return recommendations
+
+@app.post("/api/simulate", response_model=SimulationResult)
+async def run_simulation(request: SimulationRequest):
+    """Run what-if simulation using real-time system data"""
+    try:
+        # Generate unique simulation ID
+        import uuid
+        simulation_id = f"sim_{uuid.uuid4().hex[:8]}"
+        
+        # Fetch real-time data from existing endpoints
+        real_data = await fetch_real_time_data()
+        
+        # Extract structured data
+        current_trains = extract_trains_from_real_data(real_data)
+        current_sections = extract_sections_from_real_data(real_data)
+        current_disruptions = real_data.get("disruptions", {}).get("active_disruptions", {})
+        
+        # Calculate input data using real-time information
+        input_data = {
+            "current_trains": len(current_trains),
+            "active_sections": len([s for s in current_sections if s.get("id")]),
+            "system_load": calculate_system_load_from_real_data(current_trains, current_sections),
+            "active_disruptions": len(current_disruptions)
+        }
+        
+        # Analyze impact using real-time data
+        affected_trains = []
+        for train in current_trains:
+            if should_train_be_affected_by_real_scenario(train, request.parameters):
+                affected_train = {
+                    "train_id": train.get("train_id"),
+                    "current_position": train.get("current_section_id"),
+                    "projected_delay": calculate_projected_delay_from_real_data(train, request.parameters),
+                    "alternative_routes": find_alternative_routes_from_real_data(train, current_sections),
+                    "passenger_count": estimate_passenger_count_from_real_data(train)
+                }
+                affected_trains.append(affected_train)
+        
+        projected_impact = {
+            "affected_trains": affected_trains,
+            "system_metrics": calculate_system_metrics_from_real_data(
+                affected_trains, request.parameters, current_trains, current_sections
+            )
+        }
+        
+        # Generate recommendations based on real scenario impact
+        recommendations = generate_recommendations_from_real_data(
+            request.scenario_type, real_data, len(affected_trains)
+        )
+        
+        # Create simulation result
+        result = SimulationResult(
+            simulation_id=simulation_id,
+            timestamp=datetime.now().isoformat(),
+            input_data=input_data,
+            projected_impact=projected_impact,
+            recommendations=recommendations
+        )
+        
+        logger.info(f"Simulation {simulation_id} completed using real-time data: {len(affected_trains)} trains affected")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Real-time simulation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
+
+async def fetch_dynamic_scenarios() -> List[Dict]:
+    """Fetch scenario templates from real-time data or configuration"""
+    try:
+        # Try to fetch scenarios from optimization endpoint or configuration
+        async with httpx.AsyncClient() as client:
+            try:
+                # Attempt to get scenarios from optimization results
+                response = await client.get("http://127.0.0.1:8000/api/optimization/results")
+                if response.status_code == 200:
+                    data = response.json()
+                    if "scenario_templates" in data.get("data", {}):
+                        return data["data"]["scenario_templates"]
+            except:
+                pass
+            
+            # Try to fetch from health endpoint to understand current system state
+            health_response = await client.get("http://127.0.0.1:8000/health")
+            health_data = health_response.json() if health_response.status_code == 200 else {}
+            
+            # Generate dynamic scenarios based on current system health
+            scenarios = []
+            
+            # Base scenarios that adapt to current system state
+            active_disruptions = health_data.get("active_disruptions", 0)
+            total_trains = health_data.get("total_trains", 10)
+            
+            # Delay scenario - severity based on current system load
+            scenarios.append({
+                "id": "adaptive-delay",
+                "name": f"Train Delay ({total_trains} trains active)",
+                "type": "delay",
+                "description": f"Simulate delays affecting up to {min(total_trains // 2, 5)} trains",
+                "parameters": {
+                    "duration_minutes": 25 + (active_disruptions * 10),
+                    "severity": "high" if active_disruptions > 2 else "medium",
+                    "train_type": "Express"
+                }
+            })
+            
+            # Disruption scenario - adapted to current disruptions
+            scenarios.append({
+                "id": "system-disruption",
+                "name": f"Track Disruption ({'Critical' if active_disruptions > 1 else 'Standard'})",
+                "type": "disruption",
+                "description": "Complete section blockage requiring immediate rerouting",
+                "parameters": {
+                    "duration_minutes": 90 + (active_disruptions * 30),
+                    "severity": "critical" if active_disruptions > 1 else "high"
+                }
+            })
+            
+            # Maintenance scenario
+            scenarios.append({
+                "id": "scheduled-maintenance",
+                "name": "Planned Track Maintenance",
+                "type": "maintenance",
+                "description": "Scheduled maintenance reducing system capacity",
+                "parameters": {
+                    "duration_minutes": 180,
+                    "severity": "low" if datetime.now().hour < 6 or datetime.now().hour > 22 else "medium"
+                }
+            })
+            
+            # Weather scenario - time-sensitive
+            current_hour = datetime.now().hour
+            weather_severity = "high" if 6 <= current_hour <= 10 or 16 <= current_hour <= 20 else "medium"
+            scenarios.append({
+                "id": "weather-impact",
+                "name": f"Weather Conditions ({'Peak Hours' if weather_severity == 'high' else 'Off-Peak'})",
+                "type": "weather",
+                "description": "Adverse weather requiring speed restrictions",
+                "parameters": {
+                    "duration_minutes": 120,
+                    "severity": weather_severity
+                }
+            })
+            
+            return scenarios
+            
+    except Exception as e:
+        logger.error(f"Error fetching dynamic scenarios: {e}")
+        # Return basic fallback scenarios
+        return [
+            {
+                "id": "basic-delay",
+                "name": "Express Train Delay",
+                "type": "delay",
+                "description": "Standard 30-minute delay scenario",
+                "parameters": {"duration_minutes": 30, "severity": "medium"}
+            },
+            {
+                "id": "basic-disruption",
+                "name": "Track Blockage",
+                "type": "disruption",
+                "description": "Complete track blockage",
+                "parameters": {"duration_minutes": 120, "severity": "critical"}
+            }
+        ]
+
+@app.get("/api/simulation/scenarios")
+async def get_predefined_scenarios():
+    """Get list of dynamically generated simulation scenarios"""
+    try:
+        scenarios = await fetch_dynamic_scenarios()
+        return {"scenarios": scenarios}
+    except Exception as e:
+        logger.error(f"Error getting scenarios: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch simulation scenarios")
+
+@app.get("/api/simulation/system-state")
+async def get_current_system_state():
+    """Get current system state for simulation using real-time data"""
+    try:
+        # Fetch real-time data
+        real_data = await fetch_real_time_data()
+        
+        # Extract trains information
+        trains_list = extract_trains_from_real_data(real_data)
+        available_trains = [
+            {
+                "train_id": train.get("train_id"),
+                "type": train.get("type"),
+                "current_section": train.get("current_section_id"),
+                "status": train.get("status"),
+                "destination": train.get("destination_station")
+            }
+            for train in trains_list
+            if train.get("status") not in ["out_of_service", "Cancelled"]
+        ]
+        
+        # Extract sections information
+        sections_list = extract_sections_from_real_data(real_data)
+        available_sections = []
+        
+        # Get occupancy data
+        occupancy_data = {}
+        if "trains" in real_data and "section_occupancy" in real_data["trains"]:
+            occupancy_data = real_data["trains"]["section_occupancy"]
+        
+        for section in sections_list:
+            section_id = section.get("id")
+            available_sections.append({
+                "section_id": section_id,
+                "name": f"{section.get('start', 'Unknown')} - {section.get('end', 'Unknown')}",
+                "status": "operational" if not any(
+                    section_id in str(disruption) for disruption in 
+                    real_data.get("disruptions", {}).get("active_disruptions", {}).values()
+                ) else "disrupted",
+                "capacity": section.get("capacity", 2),
+                "current_occupancy": len(occupancy_data.get(section_id, []))
+            })
+        
+        # Extract disruption information
+        disruptions = list(real_data.get("disruptions", {}).get("active_disruptions", {}).values())
+        
+        return {
+            "trains": available_trains,
+            "sections": available_sections,
+            "disruptions": disruptions,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting system state: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch system state")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
